@@ -13,10 +13,13 @@ import * as sns from 'aws-cdk-lib/aws-sns';
 import * as subscriptions from 'aws-cdk-lib/aws-sns-subscriptions';
 import * as events from 'aws-cdk-lib/aws-events';
 import * as targets from 'aws-cdk-lib/aws-events-targets';
+import * as sqs from 'aws-cdk-lib/aws-sqs';
 
 export class BffLiveStack extends cdk.Stack {
   constructor(scope: Construct, id: string, props?: cdk.StackProps) {
     super(scope, id, props);
+
+    const consumerDlq = new sqs.Queue(this, 'ProjectionConsumerDLQ');
 
     const table = new dynamodb.Table(this, 'OrdersProjection', {
       partitionKey: { name: 'orderId', type: dynamodb.AttributeType.STRING },
@@ -144,7 +147,10 @@ export class BffLiveStack extends cdk.Stack {
         source: ['bff.orders'],                    // events from our "orders domain"
         detailType: ['OrderPlaced', 'OrderUpdated'],
       },
-      targets: [new targets.LambdaFunction(projectionConsumerFn)],
+      targets: [   new targets.LambdaFunction(projectionConsumerFn, {
+      deadLetterQueue: consumerDlq,   // ← failed events land here instead of vanishing
+      retryAttempts: 3,
+    }),],
     });
 
         // ── Monitoring: SNS topic that emails you on alarm ──────────────
