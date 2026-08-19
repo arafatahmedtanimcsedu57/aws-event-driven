@@ -1,7 +1,8 @@
 const { DynamoDBClient, ScanCommand } = require('@aws-sdk/client-dynamodb');
-const AWSXRay = require('aws-xray-sdk-core');
+// const AWSXRay = require('aws-xray-sdk-core');
 
-const client = AWSXRay.captureAWSv3Client(new DynamoDBClient({}));
+// const client = AWSXRay.captureAWSv3Client(new DynamoDBClient({}));
+const client = new DynamoDBClient({});
 const TABLE = process.env.TABLE_NAME;
 
 // Minimal unmarshal: turn DynamoDB's {S:"x"} / {N:"5"} shape into plain values
