@@ -11,6 +11,8 @@ import * as cloudwatch from 'aws-cdk-lib/aws-cloudwatch';
 import * as cwactions from 'aws-cdk-lib/aws-cloudwatch-actions';
 import * as sns from 'aws-cdk-lib/aws-sns';
 import * as subscriptions from 'aws-cdk-lib/aws-sns-subscriptions';
+import * as events from 'aws-cdk-lib/aws-events';
+import * as targets from 'aws-cdk-lib/aws-events-targets';
 
 export class BffLiveStack extends cdk.Stack {
   constructor(scope: Construct, id: string, props?: cdk.StackProps) {
@@ -119,6 +121,31 @@ export class BffLiveStack extends cdk.Stack {
       retryAttempts: 2,
     }));
     graph.grantMutation(streamFn, 'publishOrderUpdate');
+
+
+        // ── Event-driven ingestion: broker + projection consumer ────────
+    // The event bus — our broker. (Using the default bus keeps it simple.)
+    const bus = events.EventBus.fromEventBusName(this, 'DefaultBus', 'default');
+
+    // The projection consumer — writes the read model when a domain event arrives
+    const projectionConsumerFn = new lambda.Function(this, 'ProjectionConsumerFn', {
+      runtime: lambda.Runtime.NODEJS_20_X,
+      handler: 'consumer.handler',
+      code: lambda.Code.fromAsset('lambda'),
+      environment: { TABLE_NAME: table.tableName },
+      tracing: lambda.Tracing.ACTIVE,
+    });
+    table.grantWriteData(projectionConsumerFn);   // it WRITES the projection (least-privilege)
+
+    // The rule — routes matching domain events to the consumer
+    new events.Rule(this, 'OrderEventsRule', {
+      eventBus: bus,
+      eventPattern: {
+        source: ['bff.orders'],                    // events from our "orders domain"
+        detailType: ['OrderPlaced', 'OrderUpdated'],
+      },
+      targets: [new targets.LambdaFunction(projectionConsumerFn)],
+    });
 
         // ── Monitoring: SNS topic that emails you on alarm ──────────────
     const alarmTopic = new sns.Topic(this, 'BffAlarmTopic', {
