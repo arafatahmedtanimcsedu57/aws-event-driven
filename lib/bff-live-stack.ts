@@ -7,6 +7,10 @@ import * as apigateway from 'aws-cdk-lib/aws-apigateway';
 import * as appsync from 'aws-cdk-lib/aws-appsync';
 import * as cognito from 'aws-cdk-lib/aws-cognito';
 import { DynamoEventSource } from 'aws-cdk-lib/aws-lambda-event-sources';
+import * as cloudwatch from 'aws-cdk-lib/aws-cloudwatch';
+import * as cwactions from 'aws-cdk-lib/aws-cloudwatch-actions';
+import * as sns from 'aws-cdk-lib/aws-sns';
+import * as subscriptions from 'aws-cdk-lib/aws-sns-subscriptions';
 
 export class BffLiveStack extends cdk.Stack {
   constructor(scope: Construct, id: string, props?: cdk.StackProps) {
@@ -115,6 +119,113 @@ export class BffLiveStack extends cdk.Stack {
       retryAttempts: 2,
     }));
     graph.grantMutation(streamFn, 'publishOrderUpdate');
+
+        // ── Monitoring: SNS topic that emails you on alarm ──────────────
+    const alarmTopic = new sns.Topic(this, 'BffAlarmTopic', {
+      displayName: 'BFF Live Alarms',
+    });
+    alarmTopic.addSubscription(
+      new subscriptions.EmailSubscription('arafat.csedu.57@gmail.com')   // ← your email
+    );
+
+    const notify = new cwactions.SnsAction(alarmTopic);
+
+    // Alarm 1 — stream Lambda is erroring (live-update path broken)
+    streamFn.metricErrors({ period: cdk.Duration.minutes(1) })
+      .createAlarm(this, 'StreamFnErrorsAlarm', {
+        alarmName: 'BFF-StreamHandlerFn-Errors',
+        threshold: 1,               // 1 or more errors in a minute
+        evaluationPeriods: 1,
+        comparisonOperator: cloudwatch.ComparisonOperator.GREATER_THAN_OR_EQUAL_TO_THRESHOLD,
+        treatMissingData: cloudwatch.TreatMissingData.NOT_BREACHING,  // no data ≠ broken
+      })
+      .addAlarmAction(notify);
+
+    // Alarm 2 — read Lambda is erroring (initial load broken)
+    getOrdersFn.metricErrors({ period: cdk.Duration.minutes(1) })
+      .createAlarm(this, 'GetOrdersFnErrorsAlarm', {
+        alarmName: 'BFF-GetOrdersFn-Errors',
+        threshold: 1,
+        evaluationPeriods: 1,
+        comparisonOperator: cloudwatch.ComparisonOperator.GREATER_THAN_OR_EQUAL_TO_THRESHOLD,
+        treatMissingData: cloudwatch.TreatMissingData.NOT_BREACHING,
+      })
+      .addAlarmAction(notify);
+
+    // Alarm 3 — API Gateway returning 5xx (server errors reaching users)
+    api.metricServerError({ period: cdk.Duration.minutes(1) })
+      .createAlarm(this, 'ApiServerErrorsAlarm', {
+        alarmName: 'BFF-Api-5xx',
+        threshold: 1,
+        evaluationPeriods: 1,
+        comparisonOperator: cloudwatch.ComparisonOperator.GREATER_THAN_OR_EQUAL_TO_THRESHOLD,
+        treatMissingData: cloudwatch.TreatMissingData.NOT_BREACHING,
+      })
+      .addAlarmAction(notify);
+
+
+        // ── Monitoring dashboard: one screen for system health ──────────
+    const dashboard = new cloudwatch.Dashboard(this, 'BffDashboard', {
+      dashboardName: 'BFF-Live-Health',
+    });
+
+    dashboard.addWidgets(
+      // Row 1 — invocations and errors for both Lambdas
+      new cloudwatch.GraphWidget({
+        title: 'Lambda Invocations',
+        left: [
+          getOrdersFn.metricInvocations({ period: cdk.Duration.minutes(5) }),
+          streamFn.metricInvocations({ period: cdk.Duration.minutes(5) }),
+        ],
+        width: 12,
+      }),
+      new cloudwatch.GraphWidget({
+        title: 'Lambda Errors',
+        left: [
+          getOrdersFn.metricErrors({ period: cdk.Duration.minutes(5) }),
+          streamFn.metricErrors({ period: cdk.Duration.minutes(5) }),
+        ],
+        width: 12,
+      }),
+    );
+
+    dashboard.addWidgets(
+      // Row 2 — latency (how slow) and API traffic
+      new cloudwatch.GraphWidget({
+        title: 'Lambda Duration (ms)',
+        left: [
+          getOrdersFn.metricDuration({ period: cdk.Duration.minutes(5) }),
+          streamFn.metricDuration({ period: cdk.Duration.minutes(5) }),
+        ],
+        width: 12,
+      }),
+      new cloudwatch.GraphWidget({
+        title: 'API Requests & Errors',
+        left: [
+          api.metricCount({ period: cdk.Duration.minutes(5) }),
+          api.metricServerError({ period: cdk.Duration.minutes(5) }),
+          api.metricClientError({ period: cdk.Duration.minutes(5) }),
+        ],
+        width: 12,
+      }),
+    );
+
+    dashboard.addWidgets(
+      // Row 3 — DynamoDB read usage, and a single "current error count" number
+      new cloudwatch.GraphWidget({
+        title: 'DynamoDB Read Capacity',
+        left: [
+          table.metricConsumedReadCapacityUnits({ period: cdk.Duration.minutes(5) }),
+        ],
+        width: 12,
+      }),
+      new cloudwatch.SingleValueWidget({
+        title: 'Stream Errors (last 5 min)',
+        metrics: [streamFn.metricErrors({ period: cdk.Duration.minutes(5) })],
+        width: 12,
+      }),
+    );
+
 
     new cdk.CfnOutput(this, 'ApiUrl', { value: api.url });
     new cdk.CfnOutput(this, 'GraphqlUrl', { value: graph.graphqlUrl });
