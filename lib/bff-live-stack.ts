@@ -49,15 +49,30 @@ export class BffLiveStack extends cdk.Stack {
     const api = new apigateway.LambdaRestApi(this, 'BffApi', {
       handler: getOrdersFn,
       proxy: true,
-      defaultCorsPreflightOptions: { allowOrigins: apigateway.Cors.ALL_ORIGINS },
+      defaultCorsPreflightOptions: {
+        allowOrigins: apigateway.Cors.ALL_ORIGINS,
+        allowMethods: apigateway.Cors.ALL_METHODS,
+        allowHeaders: ['Authorization', 'Content-Type'],
+      },
       defaultMethodOptions: {
         authorizer: apiAuthorizer,
-        authorizationType: apigateway.AuthorizationType.COGNITO,   // every route now requires a valid token
+        authorizationType: apigateway.AuthorizationType.COGNITO,
       },
       deployOptions: {
-        stageName: 'v1',
+        stageName: 'orders',
         tracingEnabled: true,
       },
+    });
+
+    // ── ADD THIS ──────────────────────────────────────────────
+    // The CORS preflight (OPTIONS) can't carry a token, so it must
+    // NOT require the Cognito authorizer. Strip auth off every OPTIONS method.
+    api.methods.forEach((method) => {
+      if (method.httpMethod === 'OPTIONS') {
+        const cfn = method.node.defaultChild as apigateway.CfnMethod;
+        cfn.authorizationType = apigateway.AuthorizationType.NONE;
+        cfn.addPropertyOverride('AuthorizerId', undefined);
+      }
     });
 
     const graph = new appsync.GraphqlApi(this, 'BffGraphApi', {
