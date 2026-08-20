@@ -3,7 +3,10 @@
 An event-driven BFF (Backend-For-Frontend) on AWS: a React client reads orders over
 a REST API and stays live via a GraphQL subscription, while the read model is kept
 up to date by two independent write paths — a DynamoDB Streams pipe and an
-EventBridge domain-event consumer. Everything is provisioned with AWS CDK.
+EventBridge domain-event consumer (with an SQS dead-letter queue for failed
+deliveries). Cognito also emails users through SES, and on signup confirmation a
+VPC-bound Lambda writes a customer profile row into an RDS PostgreSQL database.
+Everything is provisioned with AWS CDK.
 
 ## Architecture
 
@@ -83,28 +86,99 @@ EventBridge domain-event consumer. Everything is provisioned with AWS CDK.
 In parallel, domain events (`OrderPlaced` / `OrderUpdated`, source `bff.orders`) published to the
 default EventBridge bus are routed by an `events.Rule` to `ProjectionConsumerFn`, which writes the
 denormalized row into `OrdersProjection` — this is the second, independent path that keeps the read
-model current and in turn triggers the same stream → AppSync → subscription fan-out above.
+model current and in turn triggers the same stream → AppSync → subscription fan-out above. If
+`ProjectionConsumerFn` fails, EventBridge retries up to 3 times and then parks the event on the
+`ProjectionConsumerDLQ` SQS queue instead of dropping it.
+
+### Signup flow (Cognito → RDS PostgreSQL)
+
+A third, independent path runs on user signup rather than on orders:
+
+```
+BROWSER ─sign up─▶ COGNITO USER POOL ─verification email (SES, ap-south-1)─▶ user
+                          │ user submits confirmation code
+                          ▼
+              Cognito confirms the user
+                          │ Post Confirmation trigger
+                          ▼
+          ┌────────────────────────────────────┐
+          │  LAMBDA  PostConfirmationFn         │   runs inside BffVpc (isolated subnet,
+          │  (post-confirmation/index.js)       │   no NAT/internet route)
+          └───────────────────┬──────────────────┘
+                          │ fetch DB credentials (cached across warm starts)
+                          ▼
+          ┌───────────────────────────────┐
+          │  SECRETS MANAGER                │◀── reached via a VPC interface endpoint
+          │  (RDS-generated password)      │
+          └───────────────┬────────────────┘
+                          │ SSL connection, port 5432
+                          ▼
+          ┌───────────────────────────────┐
+          │  RDS POSTGRES  (CustomersDb)   │
+          │  CREATE TABLE IF NOT EXISTS    │
+          │  customers (sub, email, ...)   │
+          │  INSERT ... ON CONFLICT DO     │
+          │  NOTHING                       │
+          └────────────────────────────────┘
+```
+
+1. The browser signs a user up through Cognito; Cognito emails a verification code via SES
+   (custom `fromEmail`/`fromName`, verified in `ap-south-1`).
+2. Once the user confirms with that code, Cognito invokes the `POST_CONFIRMATION` trigger,
+   `PostConfirmationFn`.
+3. The function runs inside `BffVpc`'s isolated subnet (no NAT gateway — reaches Secrets Manager
+   only through a VPC interface endpoint, keeping the whole path off the public internet).
+4. It reads the RDS master credentials from Secrets Manager (cached per warm invocation), connects
+   to `CustomersDb` over SSL, creates the `customers` table if it doesn't exist yet, and upserts a
+   `(sub, email)` row for the new user.
+5. Failures are logged, never thrown — a database hiccup must not block the signup flow, so Cognito
+   always gets its unchanged `event` back.
+
+This is a separate, disposable relational store from the DynamoDB-backed orders read model above:
+single-AZ, no automated backups, `RemovalPolicy.DESTROY`, sized for development rather than
+production use.
 
 ## Project structure
 
 ```
-bin/bff-live.ts          CDK app entry point
-lib/bff-live-stack.ts    The whole stack: DynamoDB, Lambdas, API Gateway, Cognito,
-                          AppSync, EventBridge rule, SNS alarms, CloudWatch dashboard
+bin/bff-live.ts               CDK app entry point
+lib/
+  bff-live-stack.ts            Composes the constructs below and defines the CfnOutputs
+  constructs/
+    orders-store.ts             DynamoDB OrdersProjection table (streamed read model)
+    auth.ts                      Cognito user pool + client, email delivery via SES
+    orders-api.ts                  API Gateway REST API + GetOrdersFn, Cognito authorizer
+    live-updates.ts                 AppSync API + StreamHandlerFn (stream -> subscription fan-out)
+    event-bus.ts                     EventBridge rule + ProjectionConsumerFn + SQS DLQ
+    monitoring.ts                     SNS alarm topic, CloudWatch alarms + dashboard
+    customer-db.ts                     VPC + RDS PostgreSQL + PostConfirmationFn trigger
 lambda/
-  handler.js              GetOrdersFn — scans OrdersProjection, returns JSON
-  stream.js                StreamHandlerFn — signs & posts publishOrderUpdate to AppSync
-  consumer.js              ProjectionConsumerFn — writes projection rows from EventBridge events
-graphql/schema.graphql    AppSync schema (Query/Mutation/Subscription + auth directives)
-client/                   React + Vite frontend (Amplify auth, Apollo/AppSync subscription)
-test/                     Jest unit tests for the CDK stack
+  get-orders/index.js            GetOrdersFn — scans OrdersProjection, returns JSON
+  stream-handler/index.js         StreamHandlerFn — signs & posts publishOrderUpdate to AppSync
+  projection-consumer/index.js     ProjectionConsumerFn — writes projection rows from EventBridge
+  post-confirmation/index.js        PostConfirmationFn — Cognito trigger, upserts the new user
+                                     into the RDS `customers` table
+  package.json                     Shared dependencies for all four functions (single asset bundle)
+graphql/schema.graphql        AppSync schema (Query/Mutation/Subscription + auth directives)
+client/                       React + Vite frontend (Amplify auth, Apollo/AppSync subscription)
+test/                         Jest unit tests for the CDK stack
 ```
+
+Every construct factory in `lib/constructs/` takes the stack itself as its scope (e.g.
+`createOrdersStore(this)`), so each resource's CloudFormation logical ID is identical to what it
+was in the single-file version — splitting the file doesn't trigger any resource replacement on
+deploy. All four Lambda functions still bundle from the single `lambda/` asset directory (each one
+just points `handler` at its own subfolder), so there's one shared `package.json`/`node_modules`
+rather than four duplicated installs.
 
 ## Prerequisites
 
 - Node.js 20+
 - An AWS account and credentials configured locally (`aws configure` or equivalent)
 - [AWS CDK](https://docs.aws.amazon.com/cdk/v2/guide/getting-started.html) bootstrapped in the target account/region (`cdk bootstrap`)
+- A verified SES identity (email or domain) in `ap-south-1` — Cognito sends signup/verification
+  email through it, and deploy fails if the `fromEmail` in `lib/bff-live-stack.ts` isn't verified
+  (SES sandbox accounts must also verify each recipient address)
 
 ## Deploy the backend
 
@@ -154,3 +228,5 @@ through either the DynamoDB Streams or EventBridge path.
 
 The stack also provisions a CloudWatch dashboard (`BFF-Live-Health`) and three alarms
 (stream handler errors, get-orders errors, API 5xx) that notify an SNS topic by email.
+Domain events that `ProjectionConsumerFn` fails to process after 3 retries land on the
+`ProjectionConsumerDLQ` SQS queue instead of being silently dropped.
